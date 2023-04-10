@@ -1,3 +1,2 @@
 # Tab-delimited file containing three columns
 # sample_id	/path/to/fastq_R1.fastq.gz	/path/to/fastq_R2.fastq.gz
-test_sample	/morinlab/data/novaseq/IDT_indexes/2022-07-25-HGG7JDRX2/NS.1946.002.IDT_i7_63---IDT_i5_63.211794-02_R1.fastq.gz	/morinlab/data/novaseq/IDT_indexes/2022-07-25-HGG7JDRX2/NS.1946.002.IDT_i7_63---IDT_i5_63.211794-02_R2.fastq.gz
