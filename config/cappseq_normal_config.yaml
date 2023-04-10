@@ -1,0 +1,21 @@
+cappseq_normal_workflow:
+  refgenome: "/morinlab/reference/igenomes/Homo_sapiens/GSC/GRCh38/Sequence/BWAIndex/GRCh38_no_alt.fa"  # Should contain BWA indicies and samtools fai index in the same directory
+  captureregions: "/mnt/thanos_lv/pipelines/DLBCL_Montreal/PlasmaTwistCAPPSeq/coverage/00-helperfiles/twist_panel_design.noalt.sort.annot.bed4"
+  captureregionsil: "/mnt/thanos_lv/pipelines/DLBCL_Montreal/PlasmaTwistCAPPSeq/coverage/00-helperfiles/twist_panel_design.noalt.sort.annot.interval_list"  # Picard Interval List
+  dbsnpvcf: "/morinlab/reference/igenomes/Homo_sapiens/GSC/GRCh38/Annotation/Variation/dbsnp.all.151.chr.vcf.gz"  # Should be BGzipped and TABIX indexed
+
+  # Input and output
+  samplefile: "config/samplelist.tsv"
+  baseoutdir: "/mnt/thanos_lv/pipelines/DLBCL_Montreal/PlasmaTwistCAPPSeq/cappseq_normal_workflow"
+
+  readgroup:
+    centre: "Genome_Quebec"
+    platformunit: "ILLUMINA"
+    platformmodel: "NOVASEQ"
+    description: "CAPPSeq of normal samples"
+
+  # Threads
+  fastp_threads: 4
+  bwa_threads: 16
+
+  multiqc_config: "config/multiqc_config.yaml"

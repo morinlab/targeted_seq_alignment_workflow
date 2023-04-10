@@ -1,0 +1,311 @@
+#!/usr/bin/env Snakemake
+
+import os
+import gzip
+import datetime
+
+configpath = "config/cappseq_normal_config.yaml"
+configfile: configpath
+
+# Ensure config file is correct, and all required attributes are present
+pathkeys = {"samplefile", "baseoutdir"}  # config elements that are filepaths
+for ckey, attribute in config["cappseq_normal_workflow"].items():
+    if attribute == "__UPDATE__":
+        raise AttributeError(f"\'__UPDATE__\' found for \'{ckey}\' in config file \'{configpath}\'. Please ensure the config file is updated with parameters relevant for your analysis")
+    # Check that required filepaths exist
+    if ckey in pathkeys:
+        if not os.path.exists(attribute):
+            raise AttributeError(f"Unable to locate \'{attribute}\' for key \'{ckey}\' in config file \'{configpath}\': No such file or directory")
+
+# Load samples
+# This assumes the sample file has three columns:
+# sample_id    R1_fastq_path    R2_fastq_path
+samplefile = config["cappseq_normal_workflow"]["samplefile"]
+samplelist = []
+r1_fastqs = {}
+r2_fastqs = {}
+
+# Process sample file
+with open(samplefile) as f:
+    i = 0  # Line counter
+    for line in f:
+        i += 1
+        line = line.rstrip("\n").rstrip("\r")
+        if line.startswith("#"):  # Ignore comment lines
+            continue
+        try:
+            cols = line.split("\t")
+            sample_id = cols[0]
+            r1_fastq = cols[1]
+            r2_fastq = cols[2]
+        except IndexError as e:
+            raise AttributeError(f"Unable to parse line {i} of sample file \'{samplefile}\'. Expecting three tab-delineated columns corresponding to \'sample_id\', \'R1_fastq\', and \'R2_fastq\'") from e
+        # Check that the specified FASTQs exist
+        if not os.path.exists(r1_fastq):
+            raise AttributeError(f"Unable to parse line {i} of sample file \'{samplefile}\': Unable to locate \'{r1_fastq}\': No such file or directory")
+        if not os.path.exists(r2_fastq):
+            raise AttributeError(f"Unable to parse line {i} of sample file \'{samplefile}\': Unable to locate \'{r2_fastq}\': No such file or directory")
+
+        # Check that this sample doesn't already exist
+        if sample_id in r1_fastqs:
+            raise AttributeError(f"Duplicate sample ID \'{sample_id}\' in sample file \'{samplefile}")
+        
+        # Sanity check that R1 and R2 are different files
+        if os.path.realpath(r1_fastq) == os.path.realpath(r2_fastq):
+            raise AttributeError(f"Error while parsing line {i} of sample file \'{samplefile}': R1 and R2 refer to the same file!")
+        
+        samplelist.append(sample_id)
+        r1_fastqs[sample_id] = r1_fastq
+        r2_fastqs[sample_id] = r2_fastq
+
+outdir = config["cappseq_normal_workflow"]["baseoutdir"]
+
+
+def is_gzipped(filepath):
+    with open(filepath, "rb") as f:
+        magicnum = f.read(2)
+        return magicnum == b'\x1f\x8b'  # Magic number of gzipped files
+
+
+def generate_read_group(fastq, sample):
+    # Parses flowcell, lane, and barcode information from FASTQ read names
+    # Uses this information (and config file info) to generate a read group line
+    if is_gzipped(fastq):
+        readname = gzip.open(fastq, "rt").readline()
+    else:
+        readname = open(fastq, "r").readline()
+
+    # Parse out the attributes for the read group from the read name
+    readname = readname.rstrip("\n").rstrip("\r")
+    cols = readname.split(":")
+
+    sequencer = cols[0]
+    sequencer = sequencer.replace("@","")
+    flowcell = cols[2]
+    flowcell = flowcell.split("-")[-1]
+    lane = cols[3]
+    barcode = cols[-1]
+
+    # From the config (generic and should be consistent between runs)
+    description = config["cappseq_normal_workflow"]["readgroup"]["description"]
+    centre = config["cappseq_normal_workflow"]["readgroup"]["centre"]
+    platform = config["cappseq_normal_workflow"]["readgroup"]["platformunit"]
+    platformmodel = config["cappseq_normal_workflow"]["readgroup"]["platformmodel"]
+
+    # Get the date this sample was generated.
+    # This isn't perfect, but it should be relatively close to the sequencing date.
+    origpath = os.path.realpath(fastq)
+    date = datetime.date.fromtimestamp(os.path.getctime(origpath)).isoformat()  # Get creation date of FASTQ file
+    platformunit = flowcell + "-" + lane + ":" + barcode
+
+    readgroup = f"@RG\\tID:{sample}\\tBC:{barcode}\\tCN:{centre}\\tDS:\'{description}\'\\tDT:{date}\\tLB:{sample}\\tPL:{platform}\\tPM:{platformmodel}\\tPU:{platformunit}\\tSM:{sample}"
+    return readgroup
+
+rule fastq_processing_fastp:
+    """
+    Process FASTQ files to remove trailing Illumina adapter sequences and trim low quality bases/ sequencing artifacts.
+    """
+    input:
+        r1 = lambda w: r1_fastqs[w.samplename],
+        r2 = lambda w: r2_fastqs[w.samplename]
+    output:
+        r1 = temp(os.path.join(outdir, "01-fastp", "{samplename}.R1.trimmed.fastq.gz")),
+        r2 = temp(os.path.join(outdir, "01-fastp", "{samplename}.R2.trimmed.fastq.gz")),
+        fastp_report = os.path.join(outdir, "01-fastp", "{samplename}.fastp.json")
+    params:
+        outdir = os.path.join(outdir, "01-fastp")
+    threads:
+        config["cappseq_normal_workflow"]["fastp_threads"]
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.fastp.log")
+    shell: """
+fastp --overrepresentation_analysis --detect_adapter_for_pe --in1 {input.r1} --in2 {input.r2} \
+--thread {threads} --out1 {output.r1} --out2 {output.r2} --report_title "fastp {wildcards.samplename}" \
+--json {output.fastp_report} --trim_poly_x --qualified_quality_phred 20 2> {log}
+"""
+
+rule bwa_align:
+    input:
+        r1 = rules.fastq_processing_fastp.output.r1,
+        r2 = rules.fastq_processing_fastp.output.r2
+    output:
+        bam = temp(os.path.join(outdir, "02-BWA", "{samplename}.bwa.bam"))
+    params:
+        refgenome = config["cappseq_normal_workflow"]["refgenome"],
+        readgroup = lambda w: generate_read_group(r1_fastqs[w.samplename], w.samplename),
+    threads:
+        config["cappseq_normal_workflow"]["bwa_threads"]
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.bwa.log")
+    shell: """
+bwa mem -t {threads} -R \"{params.readgroup}\" {params.refgenome} {input.r1} {input.r2} 2> {log} | \
+samtools view -b | \
+samtools sort -@ {threads} > {output.bam} 2>> {log}
+"""
+
+rule picard_fixnm_tag:
+    """
+    As Picard/GATK calculate NM tags differently than BWA, use Picard to recalculate NM tags.
+    """
+    input:
+        bam = rules.bwa_align.output.bam
+    output:
+        bam = temp(os.path.join(outdir, "03-fixnm", "{samplename}.fixnm.bam"))
+    params:
+        refgenome = config["cappseq_normal_workflow"]["refgenome"]
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.calculateNM.log")
+    shell: """
+picard SetNmMdAndUqTags --INPUT {input.bam} --OUTPUT {output.bam} --REFERENCE_SEQUENCE {params.refgenome} 2> {log}
+"""
+
+rule picard_markduplicates:
+    """
+    Mark PCR/Optical duplicates using Picard MarkDuplicates
+    """
+    input:
+        bam = rules.picard_fixnm_tag.output.bam
+    output:
+        bam = os.path.join(outdir, "04-markduplicates", "{samplename}.markduplicates.bam"),
+        stats = os.path.join(outdir, "04-markduplicates", "{samplename}.dup_metrics.txt")
+    params:
+        outdir = os.path.join(outdir, "04-markduplicates")
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.markduplicates.log")
+    shell: """
+picard MarkDuplicates --INPUT {input.bam} --OUTPUT {output.bam} -M {output.stats} > {log} 2> {log} && \
+samtools index {output.bam}
+"""
+
+### QUALITY CONTROL RULES ###
+rule qc_fastqc:
+    input:
+        bam = rules.picard_markduplicates.output.bam
+    output:
+        qc = os.path.join(outdir, "Q1-fastqc", "{samplename}.markduplicates_fastqc.html")
+    params:
+        outdir = os.path.join(outdir, "Q1-fastqc")
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.fastqc.log")
+    shell:
+        "fastqc -o {params.outdir} --nogroup -f bam {input.bam} 2> {log}"
+
+rule qc_picard_hsmetrics:
+    input:
+        bam = rules.picard_markduplicates.output.bam,
+        refgenome = config["cappseq_normal_workflow"]["refgenome"]
+    output:
+        hsmet = os.path.join(outdir, "Q2-hs_metrics", "{samplename}.hs_metrics.txt"),
+        tarcov = os.path.join(outdir, "Q2-hs_metrics", "{samplename}.target_coverage.txt")
+    params:
+        capture_reg_il = config["cappseq_normal_workflow"]["captureregionsil"],
+        outdir = outdir + os.sep + "Q2-hs_metrics",
+        max_ram_records = "5000000",
+        cov_cap_sens = "20000"
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.picard_hsmet.log")
+    shell: """
+picard CollectHsMetrics -R {input.refgenome} -TI {params.capture_reg_il} \
+-BI {params.capture_reg_il} -I {input.bam} -O {output.hsmet} --PER_TARGET_COVERAGE {output.tarcov} \
+--MAX_RECORDS_IN_RAM {params.max_ram_records} --COVERAGE_CAP {params.cov_cap_sens} 2> {log}
+"""
+
+rule qc_picard_oxog:
+    input:
+        bam = rules.picard_markduplicates.output.bam,
+        refgenome = config["cappseq_normal_workflow"]["refgenome"]
+    output:
+        txt = os.path.join(outdir, "Q3-oxog_metrics", "{samplename}.oxoG_metrics.txt")
+    params:
+        outdir = os.path.join(outdir, "Q3-oxog_metrics")
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.picard_oxoG.log")
+    shell:
+        "picard CollectOxoGMetrics -I {input.bam} -R {input.refgenome} -O {output.txt} 2> {log}"
+
+rule qc_picard_insertsize:
+    input:
+        bam = rules.picard_markduplicates.output.bam
+    output:
+        txt = os.path.join(outdir, "Q4-insert_size", "{samplename}.insert_size_metrics.txt"),
+        pdf = os.path.join(outdir, "Q4-insert_size", "{samplename}.insert_size_histogram.pdf")
+    params:
+        outdir = os.path.join(outdir, "Q4-insert_size")
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.picard_insertsize.log")
+    shell:
+        "picard CollectInsertSizeMetrics -I {input.bam} -O {output.txt} -H {output.pdf} 2> {log}"
+
+# Output sentinel confirming that the final BAMs are valid
+rule qc_validate_sam:
+    input:
+        bam = rules.picard_markduplicates.output.bam,
+        refgenome = config["cappseq_normal_workflow"]["refgenome"]
+    output:
+        txt = os.path.join(outdir, "Q5-validatesam", "{samplename}.is_valid")
+    params:
+        outdir = outdir + os.sep + "Q5-validatesam"
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "{samplename}.picardvalidatesam.log")
+    shell:
+        "picard ValidateSamFile -I {input.bam} -R {input.refgenome} > {output.txt} 2> {log}"
+
+# Merge QC results via multiqc
+checkpoint qc_multiqc:
+    input:
+        # Run multiqc once per run, and merge all samples from that run
+        dupl = lambda w: list(os.path.join(outdir, "04-markduplicates", x + ".dup_metrics.txt") for x in samplelist),
+        insertsize = lambda w: list(os.path.join(outdir,"Q4-insert_size", x + ".insert_size_metrics.txt") for x in samplelist),
+        oxog = lambda w: list(os.path.join(outdir, "Q3-oxog_metrics", x + ".oxoG_metrics.txt") for x in samplelist),
+        hsmet = lambda w: list(os.path.join(outdir, "Q2-hs_metrics", x + ".hs_metrics.txt") for x in samplelist),
+        fastp = lambda w: list(os.path.join(outdir, "01-fastp", x + ".fastp.json") for x in samplelist),
+        fastqc = lambda w: list(os.path.join(outdir, "Q1-fastqc", x + ".markduplicates_fastqc.html") for x in samplelist),
+        validatesam = lambda w: list(os.path.join(outdir, "Q5-validatesam", x + ".is_valid") for x in samplelist)
+    output:
+        html = outdir + os.sep + "Q9-multiqc" + os.sep + "multiqc_report.html",
+    params:
+        outdir = outdir + os.sep + "Q9-multiqc",
+        outname = lambda w: "multiqc_report.html",
+        modules = "-m picard -m fastqc -m fgbio -m fastp",  # Should start with -m flag
+        config = config["cappseq_normal_workflow"]["multiqc_config"],
+        dupl_dir = rules.picard_markduplicates.params.outdir,
+        insertsize_dir = rules.qc_picard_insertsize.params.outdir,
+        oxog_dir = rules.qc_picard_oxog.params.outdir,
+        hsmet_dir = rules.qc_picard_hsmetrics.params.outdir,
+        fastp_dir = rules.fastq_processing_fastp.params.outdir,
+        fastqc_dir = rules.qc_fastqc.params.outdir,
+        validsam_dir = rules.qc_validate_sam.params.outdir
+    conda:
+        "envs/fastp_bwa_picard.yaml"
+    log:
+        os.path.join(outdir, "logs", "multiqc.log")
+    shell: """
+multiqc --no-data-dir --interactive --config {params.config} --outdir {params.outdir} \
+--filename {params.outname} --force {params.modules} {params.dupl_dir} {params.insertsize_dir} \
+{params.oxog_dir} {params.hsmet_dir} {params.fastqc_dir} {params.validsam_dir} {params.fastp_dir} > {log}
+"""
+
+rule all:
+    input:
+        expand([str(rules.picard_markduplicates.output.bam),
+                str(rules.qc_multiqc.output.html)],
+            samplename=samplelist)
+    default_target: True
