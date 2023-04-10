@@ -172,10 +172,10 @@ rule picard_markduplicates:
     input:
         bam = rules.picard_fixnm_tag.output.bam
     output:
-        bam = os.path.join(outdir, "04-markduplicates", "{samplename}.markduplicates.bam"),
-        stats = os.path.join(outdir, "04-markduplicates", "{samplename}.dup_metrics.txt")
+        bam = os.path.join(outdir, "99-final", "{samplename}.markduplicates.bam"),
+        stats = os.path.join(outdir, "99-final", "{samplename}.dup_metrics.txt")
     params:
-        outdir = os.path.join(outdir, "04-markduplicates")
+        outdir = os.path.join(outdir, "99-final")
     conda:
         "envs/fastp_bwa_picard.yaml"
     log:
@@ -272,7 +272,7 @@ rule qc_validate_sam:
 checkpoint qc_multiqc:
     input:
         # Run multiqc once per run, and merge all samples from that run
-        dupl = lambda w: list(os.path.join(outdir, "04-markduplicates", x + ".dup_metrics.txt") for x in samplelist),
+        dupl = lambda w: list(os.path.join(outdir, "99-final", x + ".dup_metrics.txt") for x in samplelist),
         insertsize = lambda w: list(os.path.join(outdir,"Q4-insert_size", x + ".insert_size_metrics.txt") for x in samplelist),
         oxog = lambda w: list(os.path.join(outdir, "Q3-oxog_metrics", x + ".oxoG_metrics.txt") for x in samplelist),
         hsmet = lambda w: list(os.path.join(outdir, "Q2-hs_metrics", x + ".hs_metrics.txt") for x in samplelist),
